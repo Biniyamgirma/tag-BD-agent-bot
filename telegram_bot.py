@@ -2,6 +2,7 @@ import os
 import re
 import asyncio
 import html
+from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
 from telegram.constants import ParseMode
@@ -17,57 +18,64 @@ load_dotenv()
 
 ADMIN_USERNAMES = {
     4: "Temesgen",
-        11: "Bereket",
-        29: "Elham",
-        49: "Mentesnot",
-        115: "Kalewengel",
-        117: "@Joasap",
-        121: "Ermias",
-        198: "@Himeba1",
-        201: "@Biniyam_girma_1",
-        222: "@Belopiia",
-        225: "@chere_7",
-        227: "Meseret",
-        228: "@GkGGKKGG",
-        229: "@Mudu13",
-        240: "Bereket",
-        243: "Kalewengel",
-        258: "Mubarek",
-        261: "@Biniyam_girma_1",
-        279: "Bereket",
-        299: "Mubarak",
-        323: "@sileshiab",
-        365: "@yeab81"
+    11: "Bereket",
+    29: "Elham",
+    49: "Mentesnot",
+    115: "Kalewengel",
+    117: "@Joasap",
+    121: "Ermias",
+    198: "@Himeba1",
+    201: "@Biniyam_girma_1",
+    222: "@Belopiia",
+    225: "@chere_7",
+    227: "Meseret",
+    228: "@GkGGKKGG",
+    229: "@Mudu13",
+    240: "Bereket",
+    243: "Kalewengel",
+    258: "Mubarek",
+    261: "@Biniyam_girma_1",
+    279: "Bereket",
+    299: "Mubarak",
+    323: "@sileshiab",
+    365: "@yeab81"
 }
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 SQL_DATABASE_URL = os.environ.get("SQL_DATABASE_URL")
+
 if not BOT_TOKEN or not SQL_DATABASE_URL:
     raise RuntimeError("Set the TELEGRAM_BOT_TOKEN and DATABASE_URL environment variables.")
 
 sql_engine = create_async_engine(SQL_DATABASE_URL, pool_pre_ping=True)
 engine = create_async_engine(DATABASE_URL, pool_pre_ping=True)
+
 # --- DATABASE SETUP ---
 async def init_db():
-    """Creates the user_info table if it doesn't exist."""
     create_table_query = text("""
-        CREATE TABLE IF NOT EXISTS user_info (
-            chat_id BIGINT PRIMARY KEY,
-            username VARCHAR(255),
-            admin_id INT
+        CREATE TABLE IF NOT EXISTS bd_replies (
+            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            first_message TEXT,
+            original_message_id BIGINT,
+            tagged_admin_id BIGINT,
+            reply_message_id BIGINT,
+            chat_id BIGINT,
+            replier_username VARCHAR(255),
+            reply_text TEXT,
+            created_at TIMESTAMP,
+            updated_at TIMESTAMP NULL ON UPDATE CURRENT_TIMESTAMP
         )
     """)
     try:
         async with sql_engine.begin() as conn:
             await conn.execute(create_table_query)
-        print("Database 'user_info' table is ready.")
+        print("Database initialization complete.")
     except Exception as e:
-        print(f"Failed to create table: {e}")
+        print(f"Error initializing database: {e}")
 
 # --- START COMMAND HANDLER ---
 def get_admin_id_by_username(username: str):
-    """Matches a Telegram username to an Admin ID from our dictionary."""
     if not username:
         return None
     search_uname = username.lower().replace("@", "")
@@ -77,21 +85,16 @@ def get_admin_id_by_username(username: str):
     return None
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Saves the user's Chat ID when they start the bot."""
     user = update.effective_user
     chat_id = user.id
     username = user.username
     
-    # 1. Check if they provided an admin ID (e.g., /start 4)
     admin_id = None
     if context.args and context.args[0].isdigit():
         admin_id = int(context.args[0])
     else:
-        # 2. Try to auto-detect their admin ID using their Telegram username
         admin_id = get_admin_id_by_username(username)
         
-    # Upsert Query: Insert new user or update existing user
-    # Upsert Query: Insert new user or update existing user (MySQL Syntax)
     upsert_query = text("""
         INSERT INTO user_info (chat_id, username, admin_id) 
         VALUES (:chat_id, :username, :admin_id)
@@ -125,7 +128,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- DATABASE FETCH FUNCTIONS ---
 async def get_restaurant_info(restaurant_name: str):
-    """Fetches BD ID and Phone for a restaurant."""
     query = text("SELECT business_developer_id, phone FROM restaurants WHERE name = :restaurant_name")
     try:
         async with engine.connect() as connection:
@@ -138,7 +140,6 @@ async def get_restaurant_info(restaurant_name: str):
     return None, None
 
 async def get_saved_chat_id(admin_id: int):
-    """Checks the PostgreSQL database for the BD's saved Chat ID."""
     query = text("SELECT chat_id FROM user_info WHERE admin_id = :admin_id")
     try:
         async with sql_engine.connect() as connection:
@@ -150,7 +151,7 @@ async def get_saved_chat_id(admin_id: int):
         print(f"Error fetching chat_id: {e}")
     return None
 
-# --- MESSAGE HANDLER ---
+# --- MESSAGE HANDLER (TAGGING LOGIC) ---
 async def process_number_and_tag(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         message = update.message
@@ -171,21 +172,33 @@ async def process_number_and_tag(update: Update, context: ContextTypes.DEFAULT_T
             admin_id, phone = await get_restaurant_info(restaurant_name)
             
             if admin_id:
-                # 1. Get username for the group tag (fallback to 'Admin' if not in dictionary)
-                tg_username = ADMIN_USERNAMES.get(admin_id, f"Admin {admin_id}")
+                # --- SAVE INITIAL MESSAGE TO bd_replies ---
+                insert_initial_query = text("""
+                    INSERT INTO bd_replies (first_message, original_message_id, tagged_admin_id, created_at, chat_id)
+                    VALUES (:first_message, :original_message_id, :tagged_admin_id, :created_at, :chat_id)
+                """)
+                try:
+                    async with sql_engine.begin() as conn:
+                        await conn.execute(insert_initial_query, {
+                            "first_message": message_text,
+                            "original_message_id": message.message_id,
+                            "tagged_admin_id": admin_id,
+                            "created_at": message.date,
+                            "chat_id": message.chat_id
+                        })
+                except Exception as e:
+                    print(f"Error saving initial message to bd_replies: {e}")
+                # -------------------------------------------
                 
-                # 2. Check the database to see if they've started the bot
+                tg_username = ADMIN_USERNAMES.get(admin_id, f"Admin {admin_id}")
                 saved_chat_id = await get_saved_chat_id(admin_id)
                 
-                # Group Message Configuration
                 group_reply_text = f"{tg_username}, please review the above text for {restaurant_name}."
                 if not saved_chat_id:
-                    # Append a warning if they haven't started the bot yet
                     group_reply_text += "\n\n⚠️ Note to BD: Please send me a private message with `/start` so I can DM you!"
                 
                 await message.reply_text(group_reply_text, reply_to_message_id=message.message_id)
                 
-                # 3. If they have a saved Chat ID, send the DM
                 if saved_chat_id:
                     chat_title = message.chat.title if message.chat.title else "Private Chat"
                     display_phone = phone if phone else "Not available"
@@ -211,7 +224,7 @@ async def process_number_and_tag(update: Update, context: ContextTypes.DEFAULT_T
                             parse_mode=ParseMode.HTML,
                             reply_markup=reply_markup
                         )
-                        print(f"Successfully sent inbox message to Admin {admin_id}")
+                        print(f"Successfully sent DM to Admin {admin_id}")
                     except (Forbidden, BadRequest) as e:
                         print(f"Failed to send DM to Admin {admin_id}. Error: {e}")
 
@@ -222,24 +235,84 @@ async def process_number_and_tag(update: Update, context: ContextTypes.DEFAULT_T
     except Exception as e:
         print(f"An unexpected error occurred: {e}")
 
+# --- REPLY TRACKING HANDLER (ANALYTICS) ---
+async def track_bd_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Updates the record when a BD replies to an issue to analyze response times."""
+    message = update.message
+    
+    if not message or not message.reply_to_message:
+        return
+        
+    original_message = message.reply_to_message
+    
+    chat_id = message.chat_id
+    reply_message_id = message.message_id
+    original_message_id = original_message.message_id
+    replier_username = message.from_user.username or message.from_user.first_name
+    reply_text = message.text
+    
+    updated_at = message.date 
+
+    # We use UPDATE here based on the original_message_id saved during tagging
+    update_query = text("""
+        UPDATE bd_replies 
+        SET reply_message_id = :reply_message_id,
+            replier_username = :replier_username,
+            reply_text = :reply_text,
+            updated_at = :updated_at
+        WHERE original_message_id = :original_message_id 
+        AND chat_id = :chat_id
+    """)
+    
+    try:
+        async with sql_engine.begin() as conn:
+            result = await conn.execute(update_query, {
+                "reply_message_id": reply_message_id,
+                "replier_username": replier_username,
+                "reply_text": reply_text,
+                "updated_at": updated_at,
+                "original_message_id": original_message_id,
+                "chat_id": chat_id
+            })
+            
+            # Check if any row was actually updated
+            if result.rowcount > 0:
+                print(f"Updated BD reply from {replier_username} for analytics.")
+    except Exception as e:
+        print(f"Error updating BD reply: {e}")
+
 async def main():
-    # Initialize the database table on startup
+    # Initialize the database table before starting the bot
     # await init_db()
     
-    application = Application.builder().token(BOT_TOKEN).build()
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .read_timeout(60)
+        .write_timeout(60)
+        .connect_timeout(60)
+        .pool_timeout(60)
+        .build()
+    )
     
-    # Add CommandHandler for /start
     application.add_handler(CommandHandler("start", start_command))
     
-    # Add MessageHandler for normal text
     text_filter = filters.TEXT & ~filters.COMMAND
     application.add_handler(MessageHandler(text_filter, process_number_and_tag))
+    
+    reply_filter = filters.REPLY & filters.TEXT
+    application.add_handler(MessageHandler(reply_filter, track_bd_reply), group=1)
     
     print("Bot is running and routing orders...")
     
     await application.initialize()
     await application.start()
-    await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+    
+    await application.updater.start_polling(
+        allowed_updates=Update.ALL_TYPES,
+        timeout=60,
+        read_timeout=60
+    )
     await asyncio.Event().wait()
 
 if __name__ == '__main__':
