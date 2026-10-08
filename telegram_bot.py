@@ -208,7 +208,7 @@ async def process_number_and_tag(update: Update, context: ContextTypes.DEFAULT_T
                         f"🔔 <b>New Tag Alert!</b>\n\n"
                         f"<b>Group:</b> {html.escape(chat_title)}\n"
                         f"<b>Restaurant:</b> {html.escape(restaurant_name)}\n"
-                        f"<b>Phone:</b> {html.escape(str(display_phone))}\n\n"
+                        f"<b>Phone:</b><code> {html.escape(str(display_phone))}</code>\n\n"
                         f"<b>Message:</b>\n<i>{html.escape(message_text)}</i>"
                     )
                     
